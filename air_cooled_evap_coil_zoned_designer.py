@@ -2,6 +2,7 @@
 import math
 from math import pi, sqrt
 import traceback
+import io
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -15,6 +16,12 @@ try:
 except Exception:
     HAS_COOLPROP = False
 
+# For PDF export (pure Python)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
 # ------------------------- Constants & Psychrometrics -------------------------
 INCH = 0.0254
 MM = 1e-3
@@ -27,7 +34,6 @@ H_LV0 = 2501000.0   # J/kg at ~0°C (for moist-air enthalpy calc)
 def K(tC): return tC + 273.15
 
 def psat_water_Pa(T_C: float) -> float:
-    # Tetens-like
     return 611.21 * math.exp((18.678 - T_C/234.5) * (T_C/(257.14 + T_C)))
 
 def humidity_ratio_from_T_RH(T_C: float, RH_pct: float, P: float = P_ATM) -> float:
@@ -37,18 +43,16 @@ def humidity_ratio_from_T_RH(T_C: float, RH_pct: float, P: float = P_ATM) -> flo
     return 0.62198 * Pv / max(P - Pv, 1.0)
 
 def humidity_ratio_from_T_WB(Tdb_C: float, Twb_C: float, P: float = P_ATM) -> float:
-    # Adiabatic saturation approximation
     W_sat_wb = humidity_ratio_from_T_RH(Twb_C, 100.0, P)
     cp_da = 1006.0
     cp_wv = 1860.0
-    h_fg_wb = 2501000.0 - 2369.0 * Twb_C  # J/kg, simple linear approx vs T
+    h_fg_wb = 2501000.0 - 2369.0 * Twb_C
     numer = (W_sat_wb * (h_fg_wb + cp_wv * Twb_C) - cp_da * (Tdb_C - Twb_C))
     denom = (h_fg_wb + cp_wv * Tdb_C)
     W = numer / max(1e-9, denom)
     return max(0.0, W)
 
 def moist_air_enthalpy_J_per_kg_da(T_C: float, W: float) -> float:
-    # h (J/kg dry air)
     return 1000.0*1.006*T_C + W*(H_LV0 + 1000.0*1.86*T_C)
 
 def cp_moist_air_J_per_kgK(T_C: float, W: float) -> float:
@@ -149,19 +153,15 @@ def mix_rho_mu_homogeneous(x, rho_v, rho_l, mu_v, mu_l):
 
 # ------------------------- Design Core ----------------------------
 def design_evaporator(
-    # Geometry (SI base; UI will pass mm → m)
     face_W_m, face_H_m, St_m, Sl_m, Nr,
     Do_m, t_wall_m, FPI, tf_m, fin_k, tube_k,
-    # Airflow & state
     v_face, Vdot_m3_s,
     Tdb_in_C, RH_in_pct, use_wb_in, Twb_in_C,
     Tdb_out_req_C, RH_out_req_pct, use_wb_out, Twb_out_req_C,
-    # Refrigerant & operating
-    fluid, T_sat_evap_C, SH_out_K, mdot_ref_total,  # <-- mass flow now required
-    # Circuiting & fouling
+    fluid, T_sat_evap_C, SH_out_K, mdot_ref_total,
     tube_circuits, wet_enhance, Rf_o, Rf_i, k_tube_override=None,
 ):
-    # Convert air states
+    # Air states
     if use_wb_in:
         W_in = humidity_ratio_from_T_WB(Tdb_in_C, Twb_in_C)
     else:
@@ -171,11 +171,10 @@ def design_evaporator(
     else:
         W_out_req = humidity_ratio_from_T_RH(Tdb_out_req_C, RH_out_req_pct)
 
-    # Required capacities from air flow and air state change
+    # Required capacity from air flow
     h_in = moist_air_enthalpy_J_per_kg_da(Tdb_in_C, W_in)
     h_out_req = moist_air_enthalpy_J_per_kg_da(Tdb_out_req_C, W_out_req)
     rho_in = rho_moist_air_kg_m3(Tdb_in_C, W_in)
-    # Mass flow of dry air
     mdot_da = (rho_in * Vdot_m3_s) / (1.0 + W_in)
     Q_required_W = mdot_da * (h_in - h_out_req)
     cp_air_in = cp_moist_air_J_per_kgK(Tdb_in_C, W_in)
@@ -195,14 +194,14 @@ def design_evaporator(
     Pr_air = cp_air * mu_air / max(1e-9, k_air)
     mdot_air_total = mdot_da * (1.0 + W_in)
 
-    # Air HTC (dry) & wet enhancement
+    # Air HTC
     h_air_dry, meta_htc = air_htc_zukauskas(rho_in*(1+W_in), mu_air, k_air, Pr_air, Do_m, Nr, mdot_air_total, A_min)
     h_air = h_air_dry * wet_enhance
     Lc = max(0.5*(min(St_m, Sl_m) - Do_m), 1e-6)
     eta_f = fin_efficiency_infinite_plate(h_air, fin_k, tf_m, Lc)
     eta_o = 1.0 - (geom['A_fin']/max(Ao,1e-9))*(1.0 - eta_f)
 
-    # Refrigerant properties (CoolProp)
+    # Refrigerant properties
     if not HAS_COOLPROP:
         raise RuntimeError("CoolProp is required. Add 'CoolProp>=6.6' to requirements.txt and redeploy.")
     T_sat_K = K(T_sat_evap_C)
@@ -229,9 +228,9 @@ def design_evaporator(
         invU = (1.0/max(1e-9, eta_o*h_out)) + Rf_o + Ao_Ai*((1.0/max(1e-9, h_i)) + Rf_i) + R_wall_per_Ao
         return 1.0 / invU
 
-    # Inside HTCs (simple Dittus-Boelter)
+    # Inside HTCs (Dittus–Boelter)
     Ai = pi*(Di**2)/4.0
-    mdot_ref_total = max(1e-9, mdot_ref_total)  # ensure positive
+    mdot_ref_total = max(1e-9, mdot_ref_total)
     mdot_per_circ = mdot_ref_total / max(1, tube_circuits)
     G_i = mdot_per_circ / max(1e-9, Ai)
 
@@ -246,15 +245,13 @@ def design_evaporator(
     h_i_vap, Re_v, Pr_v = h_i_single(mu_v, k_v, cp_v, rho_v, Di, G_i)
     h_i_tp  = max(800.0, 1.8*h_i_liq)
 
-    # Zone U values
-    U_super = Uo_from(h_i_vap, h_air_dry)   # superheat rows dry
-    U_boil  = Uo_from(h_i_tp,  h_air)       # boiling wet
-    U_pre   = Uo_from(h_i_liq, h_air)       # pre-evap
+    U_super = Uo_from(h_i_vap, h_air_dry)   # superheat rows are mostly dry
+    U_boil  = Uo_from(h_i_tp,  h_air)       # boiling rows wet
+    U_pre   = Uo_from(h_i_liq, h_air)       # liquid rows, likely wet
 
-    # Air capacity (dry-air basis)
     C_air = mdot_da * cp_air
 
-    # Zone allocation (air enters at superheat rows)
+    # Row allocation (air hits superheat first)
     rows_SH   = max(0.5, 0.20 * Nr)
     rows_BOIL = max(1.0, 0.60 * Nr)
     rows_PRE  = max(0.5, Nr - rows_SH - rows_BOIL)
@@ -273,7 +270,7 @@ def design_evaporator(
     Q_SH = min(Q_SH_req, eps_SH * Cmin * dT_in_SH)
     unmet_SH = Q_SH < 0.999*Q_SH_req
 
-    # Row reallocation to satisfy SH first
+    # Reallocate rows if SH unmet
     def rows_needed_for_Q(U, Q_target, Cmin, dT_in, Cr):
         target = min(0.999999, max(1e-8, Q_target/(Cmin*dT_in)))
         lo, hi = 1e-6, 80.0
@@ -302,7 +299,7 @@ def design_evaporator(
 
     T_air_after_SH = T_air_in - Q_SH/max(1e-9, C_air)
 
-    # Boiling zone (enthalpy ε–NTU with isothermal cold side)
+    # Boiling zone (isothermal cold side)
     dT_in_BOIL = max(0.1, T_air_after_SH - T_sat_evap_C)
     UA_BOIL = U_boil * rows_BOIL * area_per_row
     NTU_BOIL = UA_BOIL / max(1e-9, C_air)
@@ -312,7 +309,7 @@ def design_evaporator(
     T_air_after_BOIL = T_air_after_SH - Q_BOIL/max(1e-9, C_air)
     unmet_BOIL = (Q_BOIL + 1e-6) < eps_BOIL*C_air*dT_in_BOIL and Q_BOIL_cap < eps_BOIL*C_air*dT_in_BOIL
 
-    # Pre-evap (liq → sat)
+    # Pre-evap (liq→sat)
     dT_ref_liq = 5.0
     C_ref_PRE = mdot_ref_total * cp_l
     Cmin2 = min(C_air, C_ref_PRE); Cmax2 = max(C_air, C_ref_PRE); Cr2 = Cmin2/max(1e-9, Cmax2)
@@ -332,7 +329,6 @@ def design_evaporator(
     W_out = max(0.0, W_in - Q_lat_W/max(1e-9, mdot_da*(H_LV0)))
     RH_out = RH_from_T_W(T_air_out, W_out)
 
-    # Wet-bulb out (approx)
     def wb_from_T_RH_like(Tdb, W_target):
         lo, hi = 0.0, Tdb
         for _ in range(40):
@@ -356,11 +352,20 @@ def design_evaporator(
     L_BOIL = frac_BOIL*L_total_per_circuit
     L_PRE = frac_PRE*L_total_per_circuit
 
+    def f_churchill(Re, e_over_D=1.5e-6/9.5e-3):
+        Re = max(1e-9, Re)
+        if Re < 2300.0:
+            return 64.0 / max(1.0, Re)
+        A = (2.457 * math.log( (7.0 / max(1.0, Re))**0.9 + 0.27*e_over_D ))**16
+        B = (37530.0 / max(1.0, Re))**16
+        f = 8.0 * ( ( (8.0 / max(1.0, Re))**12 ) + 1.0 / ( (A + B)**1.5 ) )**(1.0/12.0)
+        return max(1e-6, f)
+
     def dp_vel(G, rho, mu, D, L):
         Re = max(1e-9, G*D/max(1e-12, mu))
         f = f_churchill(Re, 1.5e-6/max(1e-12, D))
         dp = f * (L/max(1e-12, D)) * (G**2) / (2.0*max(1e-9, rho))
-        v = G/max(1e-9, rho) / (pi*(D**2)/4.0)  # m/s
+        v = G/max(1e-9, rho) / (pi*(D**2)/4.0)
         return dp, Re, v, f
 
     dp_SH, Re_SH, vel_SH, f_SH = dp_vel(G,  rho_v, mu_v, Di, L_SH)
@@ -369,14 +374,13 @@ def design_evaporator(
     dp_PRE, Re_PRE, vel_PRE, f_PRE = dp_vel(G,  rho_l, mu_l, Di, L_PRE)
     dp_total_kPa = (dp_SH + dp_BOIL + dp_PRE)/1000.0
 
-    # Zone-limitation text
+    # Limitation text
     insuff = []
     if unmet_SH: insuff.append("Superheat zone")
     if unmet_BOIL: insuff.append("Boiling zone")
     if unmet_PRE: insuff.append("Pre-evap zone")
     insuff_text = ", ".join(insuff) if insuff else "None"
 
-    # Pack outputs
     rows_df = pd.DataFrame([
         ["Superheat (vapor) @ hot face",  Q_SH/1000.0,   rows_SH,  U_super*rows_SH*area_per_row, NTU_SH,  (eps_SH),  L_SH,   Re_SH,   f_SH,   vel_SH,  dp_SH/1000.0],
         ["Boiling (2φ @ Tsat) middle",    Q_BOIL/1000.0, rows_BOIL, U_boil*rows_BOIL*area_per_row, NTU_BOIL, (eps_BOIL), L_BOIL, Re_BOIL, f_BOIL, vel_BOIL, dp_BOIL/1000.0],
@@ -384,48 +388,37 @@ def design_evaporator(
     ], columns=["Zone","Q (kW)","Rows used","UA (W/K)","NTU","ε","L per circuit (m)","Re","f","Vel (m/s)","Δp_zone (kPa)"])
 
     summary = {
-        # Required vs achieved
         "Q_required_kW": Q_required_W/1000.0,
         "Q_sensible_required_kW": Q_sensible_required_W/1000.0,
         "Q_achieved_kW": (Q_total_W)/1000.0,
         "Q_sensible_achieved_kW": Q_sens_W/1000.0,
-        # Leaving air achieved
         "Air_out_DB_C": T_air_out,
         "Air_out_WB_C": Twb_out,
         "Air_out_RH_pct": RH_out,
-        # Rows
         "Rows_entered": Nr,
         "Rows_SH": rows_SH, "Rows_BOIL": rows_BOIL, "Rows_PRE": rows_PRE,
         "Zone_limitation": insuff_text,
-        # Areas & lengths
         "A_face_m2": A_face, "A_total_o_m2": Ao, "A_min_m2": A_min,
         "Ao/row_m2": area_per_row, "Tubes_per_row": tubes_per_row,
         "Tube_length_per_circuit_m": L_total_per_circuit,
-        # Airflow
         "Face_velocity_m_s": v_face_calc, "Vdot_m3_s": Vdot_m3_s,
         "Air_dP_Pa": dp_air,
-        # Refrigerant props @ Tsat
         "Fluid": fluid, "Tsat_C": T_sat_evap_C, "Psat_bar": P_sat_Pa/1e5,
         "rho_l": rho_l, "rho_v": rho_v, "mu_l_Pas": mu_l, "mu_v_Pas": mu_v,
         "cp_l": cp_l, "cp_v": cp_v, "h_fg_kJ_per_kg": h_fg/1000.0,
-        # Tube/fin materials
         "k_fin_used_W_mK": fin_k, "k_tube_used_W_mK": k_tube,
-        # Refrigerant mass flow
         "mdot_ref_total_kg_s": mdot_ref_total,
         "mdot_ref_per_circuit_kg_s": mdot_per_circ,
-        # Ref Δp & velocities
         "Ref_dP_total_kPa": dp_total_kPa,
         "Re_SH": Re_SH, "Re_BOIL": Re_BOIL, "Re_PRE": Re_PRE,
         "Vel_SH_m_s": vel_SH, "Vel_BOIL_m_s": vel_BOIL, "Vel_PRE_m_s": vel_PRE,
     }
-
     return rows_df, summary
 
 # ------------------------- UI ----------------------------
-
 st.title("DX Evaporator — Zoned ε–NTU Designer (Single File)")
 
-# Geometry
+# Geometry & materials
 st.header("Geometry & Materials")
 colg1, colg2, colg3, colg4 = st.columns(4)
 with colg1:
@@ -462,7 +455,7 @@ MAT_K = {"Copper": 380.0, "Aluminum": 205.0, "Steel": 50.0, "CuNi 90/10": 29.0}
 fin_k = MAT_K[fin_mat]
 tube_k = MAT_K[tube_mat]
 
-# Airflow input
+# Airflow & states
 st.header("Airflow & Inlet/Outlet Air State")
 airflow_mode = st.radio("Airflow input mode", ["Face velocity (m/s)", "Volume flow (m³/h)"], horizontal=True)
 if airflow_mode == "Face velocity (m/s)":
@@ -473,7 +466,6 @@ else:
     Vdot_m3_s = Vdot_m3_h / 3600.0
     v_face = Vdot_m3_s / max(1e-9, face_W * face_H)
 
-# Air state input modes
 air_in_mode = st.radio("Inlet air condition input", ["DB + RH", "DB + WB"], horizontal=True)
 if air_in_mode == "DB + RH":
     Tdb_in = st.number_input("DB in (°C)", 5.0, 55.0, 27.0, 0.1, format="%.1f")
@@ -496,14 +488,14 @@ else:
     RH_out_req = 95.0
     use_wb_out = True
 
-# Refrigerant selection & operating
+# Refrigerant & operating
 st.header("Refrigerant & Operating")
 fluid = st.selectbox("Refrigerant (CoolProp name)", ["R134a", "R410A", "R407C", "R404A", "R32", "R22"])
 Tsat = st.number_input("Evaporating saturation temperature Tsat (°C)", -20.0, 15.0, 6.0, 0.1, format="%.1f")
 SH = st.number_input("Required refrigerant superheat (K)", 0.0, 25.0, 6.0, 0.5, format="%.1f")
 wet_enh = st.number_input("Wet enhancement factor (air)", 1.0, 2.5, 1.35, 0.05, format="%.2f")
 
-# NEW: Refrigerant mass flow input
+# Refrigerant mass flow input
 mdot_ref_total = st.number_input("Total refrigerant mass flow (kg/s)", 0.001, 2.000, 0.080, 0.001, format="%.3f")
 
 # Fouling
@@ -575,5 +567,102 @@ st.dataframe(rows.style.format({
 with st.expander("Intermediate values & diagnostics", expanded=False):
     diag = pd.DataFrame.from_dict(summary, orient="index", columns=["Value"])
     st.dataframe(diag, use_container_width=True)
+
+# ------------------------- PDF Export ----------------------------
+def build_pdf(inputs_dict, rows_df, summary_dict) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=24)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("DX Evaporator — Zoned ε–NTU Report", styles["Title"]))
+    story.append(Spacer(1, 8))
+
+    # Inputs
+    story.append(Paragraph("Inputs", styles["Heading2"]))
+    inp_items = [[k, f"{v}"] for k, v in inputs_dict.items()]
+    t = Table([["Parameter", "Value"]] + inp_items, colWidths=[180, 320])
+    t.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0),colors.HexColor("#f0f0f0")),
+        ('GRID',(0,0),(-1,-1),0.25,colors.grey),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold')
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 10))
+
+    # Zone table
+    story.append(Paragraph("Zone Results", styles["Heading2"]))
+    zone_data = [rows_df.columns.tolist()] + rows_df.round({
+        "Q (kW)":2,"Rows used":2,"UA (W/K)":0,"NTU":2,"ε":3,"L per circuit (m)":2,"Re":0,"f":4,"Vel (m/s)":2,"Δp_zone (kPa)":2
+    }).values.tolist()
+    tz = Table(zone_data, repeatRows=1)
+    tz.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0),colors.HexColor("#f0f0f0")),
+        ('GRID',(0,0),(-1,-1),0.25,colors.grey),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+        ('FONTSIZE',(0,0),(-1,-1),8),
+    ]))
+    story.append(tz)
+    story.append(Spacer(1, 10))
+
+    # Summary
+    story.append(Paragraph("Summary", styles["Heading2"]))
+    sum_items = [[k, f"{v}"] for k, v in summary_dict.items()]
+    ts = Table([["Metric", "Value"]] + sum_items, colWidths=[200, 300])
+    ts.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0),colors.HexColor("#f0f0f0")),
+        ('GRID',(0,0),(-1,-1),0.25,colors.grey),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+        ('FONTSIZE',(0,0),(-1,-1),9),
+    ]))
+    story.append(ts)
+
+    doc.build(story)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+# Inputs dict for report
+inputs_dict = {
+    "Face W (m)": face_W,
+    "Face H (m)": face_H,
+    "Row-to-row pitch (mm)": St_mm,
+    "Longitudinal pitch (mm)": Sl_mm,
+    "Rows": Nr,
+    "Tube OD (mm)": Do_mm,
+    "Tube wall (mm)": tw_mm,
+    "FPI (1/in)": FPI,
+    "Fin thickness (mm)": tf_mm,
+    "Fin material": fin_mat,
+    "Fin k (W/m·K)": MAT_K[fin_mat],
+    "Tube material": tube_mat,
+    "Tube k (W/m·K)": MAT_K[tube_mat],
+    "Tube circuits": Nr_circuits,
+    "Airflow mode": "Face velocity" if airflow_mode.startswith("Face") else "Volume flow",
+    "Face velocity (m/s)": v_face,
+    "Vol. flow (m³/s)": Vdot_m3_s,
+    "Inlet mode": air_in_mode,
+    "DB in (°C)": Tdb_in,
+    "RH in (%)": RH_in if not (air_in_mode=="DB + WB") else "—",
+    "WB in (°C)": Twb_in if (air_in_mode=="DB + WB") else "—",
+    "Outlet mode": air_out_mode,
+    "Req. DB out (°C)": Tdb_out_req,
+    "Req. RH out (%)": RH_out_req if not (air_out_mode=="DB + WB") else "—",
+    "Req. WB out (°C)": Twb_out_req if (air_out_mode=="DB + WB") else "—",
+    "Refrigerant": fluid,
+    "Tsat evap (°C)": Tsat,
+    "Superheat (K)": SH,
+    "Wet enhancement": wet_enh,
+    "ṁ_ref total (kg/s)": mdot_ref_total,
+}
+
+# One-click download
+pdf_bytes = build_pdf(inputs_dict, rows, summary)
+st.download_button(
+    label="📄 Download report (PDF)",
+    data=pdf_bytes,
+    file_name="DX_Evaporator_zoned_ntu_report.pdf",
+    mime="application/pdf"
+)
 
 st.caption("Notes: Tube/fin thermal conductivities inferred from material selections and shown above. Refrigerant properties are pulled from CoolProp at the entered Tsat. Wet enhancement applied in Boiling and Pre-evap zones; Superheat rows use dry-air HTC.")
