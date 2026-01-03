@@ -157,7 +157,7 @@ def design_evaporator(
     Tdb_in_C, RH_in_pct, use_wb_in, Twb_in_C,
     Tdb_out_req_C, RH_out_req_pct, use_wb_out, Twb_out_req_C,
     # Refrigerant & operating
-    fluid, T_sat_evap_C, SH_out_K,
+    fluid, T_sat_evap_C, SH_out_K, mdot_ref_total,  # <-- mass flow now required
     # Circuiting & fouling
     tube_circuits, wet_enhance, Rf_o, Rf_i, k_tube_override=None,
 ):
@@ -231,10 +231,7 @@ def design_evaporator(
 
     # Inside HTCs (simple Dittus-Boelter)
     Ai = pi*(Di**2)/4.0
-    # Total refrigerant mass flow estimated from required load
-    Q_req_W = max(Q_required_W, 1.0)
-    mdot_ref_total = Q_req_W / max(1e3, (h_fg + cp_v*SH_out_K))
-    mdot_ref_total = max(0.02, min(0.5, mdot_ref_total))  # clamp to reasonable range
+    mdot_ref_total = max(1e-9, mdot_ref_total)  # ensure positive
     mdot_per_circ = mdot_ref_total / max(1, tube_circuits)
     G_i = mdot_per_circ / max(1e-9, Ai)
 
@@ -352,7 +349,6 @@ def design_evaporator(
 
     # Refrigerant Δp & velocities per zone
     Ai = pi*(Di**2)/4.0
-    mdot_per_circ = mdot_ref_total / max(1, tube_circuits)
     G = mdot_per_circ / max(1e-9, Ai)
 
     frac_SH, frac_BOIL, frac_PRE = rows_SH/Nr, rows_BOIL/Nr, rows_PRE/Nr
@@ -414,6 +410,9 @@ def design_evaporator(
         "cp_l": cp_l, "cp_v": cp_v, "h_fg_kJ_per_kg": h_fg/1000.0,
         # Tube/fin materials
         "k_fin_used_W_mK": fin_k, "k_tube_used_W_mK": k_tube,
+        # Refrigerant mass flow
+        "mdot_ref_total_kg_s": mdot_ref_total,
+        "mdot_ref_per_circuit_kg_s": mdot_per_circ,
         # Ref Δp & velocities
         "Ref_dP_total_kPa": dp_total_kPa,
         "Re_SH": Re_SH, "Re_BOIL": Re_BOIL, "Re_PRE": Re_PRE,
@@ -504,6 +503,9 @@ Tsat = st.number_input("Evaporating saturation temperature Tsat (°C)", -20.0, 1
 SH = st.number_input("Required refrigerant superheat (K)", 0.0, 25.0, 6.0, 0.5, format="%.1f")
 wet_enh = st.number_input("Wet enhancement factor (air)", 1.0, 2.5, 1.35, 0.05, format="%.2f")
 
+# NEW: Refrigerant mass flow input
+mdot_ref_total = st.number_input("Total refrigerant mass flow (kg/s)", 0.001, 2.000, 0.080, 0.001, format="%.3f")
+
 # Fouling
 st.header("Fouling (optional)")
 colf1, colf2 = st.columns(2)
@@ -527,7 +529,7 @@ try:
         v_face=v_face, Vdot_m3_s=Vdot_m3_s,
         Tdb_in_C=Tdb_in, RH_in_pct=RH_in, use_wb_in=use_wb_in, Twb_in_C=Twb_in,
         Tdb_out_req_C=Tdb_out_req, RH_out_req_pct=RH_out_req, use_wb_out=use_wb_out, Twb_out_req_C=Twb_out_req,
-        fluid=fluid, T_sat_evap_C=Tsat, SH_out_K=SH,
+        fluid=fluid, T_sat_evap_C=Tsat, SH_out_K=SH, mdot_ref_total=mdot_ref_total,
         tube_circuits=Nr_circuits, wet_enhance=wet_enh, Rf_o=Rfo, Rf_i=Rfi,
         k_tube_override=None,
     )
