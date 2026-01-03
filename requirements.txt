@@ -6,3 +6,4 @@ beautifulsoup4>=4.12
 lxml>=5.1
 rapidfuzz>=3.5
 numpy>=1.26
+CoolProp>=6.6
