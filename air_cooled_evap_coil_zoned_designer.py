@@ -193,7 +193,7 @@ def design_evaporator(
     Vdot_m3_s,
     Tdb_in_C, RH_in_pct, use_wb_in, Twb_in_C,
     Tdb_out_req_C, RH_out_req_pct, use_wb_out, Twb_out_req_C,
-    fluid, T_sat_evap_C, SH_req_K, mdot_ref_total,
+    fluid, T_sat_evap_C, SH_req_K, mdot_ref_total, x_in,
     tube_circuits, wet_enhance, Rf_o, Rf_i,
 ):
     # --- Air inlet/outlet targets (for "required")
@@ -251,6 +251,14 @@ def design_evaporator(
     mu_v  = PropsSI("V","T",T_sat_K,"Q",1,fluid)
     cp_v  = PropsSI("C","T",T_sat_K,"Q",1,fluid)
     k_v   = PropsSI("L","T",T_sat_K,"Q",1,fluid)
+
+    # Saturated liquid properties for evaporation capacity limit
+    rho_l = PropsSI("D","T",T_sat_K,"Q",0,fluid)
+    mu_l  = PropsSI("V","T",T_sat_K,"Q",0,fluid)
+    cp_l  = PropsSI("C","T",T_sat_K,"Q",0,fluid)
+    k_l   = PropsSI("L","T",T_sat_K,"Q",0,fluid)
+    h_fg  = PropsSI("H","T",T_sat_K,"Q",1,fluid) - PropsSI("H","T",T_sat_K,"Q",0,fluid)
+
 
     # Tube inside
     Di = max(Do_m - 2.0*t_wall_m, 1e-5)
@@ -346,8 +354,41 @@ def design_evaporator(
     NTU_h = UA_EV / max(1e-12, (mdot_da * cp_ref))
     BF = math.exp(-NTU_h)
 
-    h_out = BF*moist_air_enthalpy_J_per_kg_da(T_air_2, W_air_2) + (1.0-BF)*h_sat_surf
-    W_out = BF*W_air_2 + (1.0-BF)*W_sat_surf
+    
+    # Refrigerant-side capacity cap (prevents impossible Q_air > Q_ref)
+    x_in = max(0.0, min(1.0, x_in))
+    Q_ref_evap_max = mdot_ref_total * h_fg * max(0.0, (1.0 - x_in))  # W
+    Q_ref_sh_max   = mdot_ref_total * cp_v * SH_req_K                 # W (same as Q_SH_req)
+    Q_ref_total_max = Q_ref_evap_max + Q_ref_sh_max
+
+    # Ideal (UA-driven) wet-coil outlet enthalpy/humidity via BF mixing:
+    h_out_ideal = BF*moist_air_enthalpy_J_per_kg_da(T_air_2, W_air_2) + (1.0-BF)*h_sat_surf
+    W_out_ideal = BF*W_air_2 + (1.0-BF)*W_sat_surf
+
+    # Compute UA-driven total air-side duty
+    Q_total_ideal_W = mdot_da * (h_in - h_out_ideal)
+
+    if Q_total_ideal_W > Q_ref_total_max + 1e-6:
+        # Coil UA says you *could* do more, but refrigerant limits you.
+        # Enforce total duty = Q_ref_total_max by solving for an "effective" BF_eff on enthalpy mixing.
+        h_out_target = h_in - Q_ref_total_max/max(1e-12, mdot_da)
+
+        h_in2 = moist_air_enthalpy_J_per_kg_da(T_air_2, W_air_2)
+        denom = (h_in2 - h_sat_surf)
+        if abs(denom) < 1e-9:
+            BF_eff = 1.0
+        else:
+            BF_eff = (h_out_target - h_sat_surf)/denom
+        BF_eff = max(0.0, min(1.0, BF_eff))
+
+        h_out = BF_eff*h_in2 + (1.0-BF_eff)*h_sat_surf
+        W_out = BF_eff*W_air_2 + (1.0-BF_eff)*W_sat_surf
+        BF_used = BF_eff
+    else:
+        # UA limits (or just right)
+        h_out = h_out_ideal
+        W_out = W_out_ideal
+        BF_used = BF
 
     T_air_out = solve_T_from_h_W(h_out, W_out)
     # Physical clamps
@@ -432,6 +473,8 @@ def design_evaporator(
         "Tsat_C": T_sat_evap_C,
         "Psat_bar": P_sat_Pa/1e5,
         "mdot_ref_total_kg_s": mdot_ref_total,
+        "x_in": x_in,
+        "Q_ref_total_max_kW": Q_ref_total_max/1000.0,
         "mdot_ref_per_circuit_kg_s": mdot_per_circ,
         "Ref_dP_total_kPa": dp_total_kPa,
         "Vel_SH_m_s": vel_SH,
@@ -443,7 +486,7 @@ def design_evaporator(
         "T_surface_assumed_C": T_surf,
         "h_sat_surface_kJ_kgda": h_sat_surf/1000.0,
         "W_sat_surface": W_sat_surf,
-        "BF_evap": BF,
+        "BF_evap": BF_used,
     }
     return rows_df, summary
 
@@ -523,6 +566,9 @@ Tsat = st.number_input("Evaporating saturation temperature Tsat (°C)", -20.0, 2
 SH_req = st.number_input("Required refrigerant superheat at outlet (K)", 0.0, 25.0, 6.0, 0.5, format="%.1f")
 wet_enh = st.number_input("Wet enhancement factor (air)", 1.0, 2.5, 1.35, 0.05, format="%.2f")
 mdot_ref_total = st.number_input("Total refrigerant mass flow (kg/s)", 0.001, 2.000, 0.080, 0.001, format="%.3f")
+
+# Refrigerant inlet quality (after expansion / distributor)
+x_in = st.number_input("Evaporator inlet quality x_in (0–1)", 0.0, 1.0, 0.25, 0.01, format="%.2f")
 
 st.header("Fouling (optional)")
 colf1, colf2 = st.columns(2)
@@ -672,6 +718,7 @@ inputs_dict = {
     "Superheat required (K)": SH_req,
     "Wet enhancement factor": wet_enh,
     "ṁ_ref total (kg/s)": mdot_ref_total,
+    "x_in": x_in,
     "Air-side fouling": Rfo,
     "Tube-side fouling": Rfi,
 }
