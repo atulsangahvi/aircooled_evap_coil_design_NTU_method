@@ -354,7 +354,8 @@ def simulate_evaporator(
                 if frac_rem > 1e-6:
                     # treat remaining UA proportionally
                     UA2 = UA*frac_rem
-                    BF = math.exp(-UA2/max(mdot_da,1e-12))
+                    NTU_h = UA2/max(mdot_da*cp_a,1e-12)
+                    BF = math.exp(-NTU_h)
                     h_out = h_sat + BF*(h_air - h_sat)
                     Q_2p = mdot_da*(h_air - h_out)
                     # cap by remaining evaporation potential to reach x_in at coil inlet (end of march)
@@ -409,7 +410,8 @@ def simulate_evaporator(
             U = Uo(h_i, h_air_wet, eta_o_wet)
             UA = U*Arow
 
-            BF = math.exp(-UA/max(mdot_da,1e-12))
+            NTU_h = UA/max(mdot_da*cp_a,1e-12)
+            BF = math.exp(-NTU_h)
             h_out = h_sat + BF*(h_air - h_sat)
             Q = mdot_da*(h_air - h_out)
 
@@ -417,13 +419,22 @@ def simulate_evaporator(
             Q_cap = mdot_ref_total*h_fg*max(0.0, x - x_in)
             Q = min(Q, Q_cap)
 
-            # update air enthalpy
-            h_air = h_air - Q/max(mdot_da,1e-12)
-            # update air temp and W via enthalpy inversion at T >= Tsat
-            # keep T_air >= Tsat (no frost modeling)
-            T_air = max(Tsat_C, T_air - Q/max(mdot_da*cp_a,1e-12))
-            W_guess = max(0.0, (h_air - 1000*1.006*T_air)/(H_LV0 + 1000*1.86*T_air))
-            W_air = min(W_guess, W_from_T_RH(T_air,100.0))
+            # update air state using bypass-factor line to saturation at Tsat
+            T_in_row = T_air
+            W_in_row = W_air
+            T_out_row = Tsat_C + BF*(T_in_row - Tsat_C)
+            W_out_row = W_sat + BF*(W_in_row - W_sat)
+            h_out_row = h_moist_J_per_kg_da(T_out_row, W_out_row)
+            Q_uncap = mdot_da*(h_air - h_out_row)
+            if Q_uncap > Q + 1e-9:
+                fracQ = max(0.0, min(1.0, Q/max(Q_uncap,1e-12)))
+                BF_eff = 1.0 - (1.0-BF)*fracQ
+                T_out_row = Tsat_C + BF_eff*(T_in_row - Tsat_C)
+                W_out_row = W_sat + BF_eff*(W_in_row - W_sat)
+                h_out_row = h_moist_J_per_kg_da(T_out_row, W_out_row)
+            T_air = max(Tsat_C, T_out_row)
+            W_air = max(0.0, min(W_out_row, W_from_T_RH(T_air,100.0)))
+            h_air = h_moist_J_per_kg_da(T_air, W_air)
 
             Q_total += Q
             # update quality backward
