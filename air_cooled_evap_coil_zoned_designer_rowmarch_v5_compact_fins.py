@@ -390,7 +390,7 @@ def simulate_evaporator(
     # Air-side pressure drop (simple sum per row: use face velocity and core velocity model similar to your condenser)
     v_face = Vdot_m3_s/max(geom["face_area"],1e-9)
     # crude fin-channel model
-    fin_pitch = geom["s"]
+    fin_pitch = geom.get("fin_pitch", geom.get("s"))
     s_fin = max(1e-6, fin_pitch - tf)
     D_h = 2.0*s_fin
     v_core = v_face*(geom["face_area"]/Amin)
